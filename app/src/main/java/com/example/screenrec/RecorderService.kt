@@ -9,12 +9,14 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import android.widget.Toast
+import java.util.concurrent.CopyOnWriteArrayList
 
 /** Foreground-сервис: держит запись живой, пока приложение свёрнуто. */
 class RecorderService : Service() {
@@ -22,6 +24,8 @@ class RecorderService : Service() {
     companion object {
         const val ACTION_START = "com.example.screenrec.START"
         const val ACTION_STOP = "com.example.screenrec.STOP"
+        const val ACTION_PAUSE = "com.example.screenrec.PAUSE"
+        const val ACTION_RESUME = "com.example.screenrec.RESUME"
         const val EXTRA_RESULT_CODE = "resultCode"
         const val EXTRA_DATA = "data"
         const val EXTRA_MAX_SHORT = "maxShort"
@@ -37,20 +41,43 @@ class RecorderService : Service() {
         @Volatile
         var isRecording = false
 
-        /** Вызывается в главном потоке при смене состояния записи. */
         @Volatile
-        var onStateChanged: (() -> Unit)? = null
+        var isPaused = false
+
+        private val listeners = CopyOnWriteArrayList<() -> Unit>()
+
+        fun addListener(l: () -> Unit) {
+            listeners.addIfAbsent(l)
+        }
+
+        fun removeListener(l: () -> Unit) {
+            listeners.remove(l)
+        }
+
+        /** Сообщает всем слушателям (в главном потоке) об изменении состояния записи. */
+        fun dispatchState() {
+            Handler(Looper.getMainLooper()).post {
+                for (l in listeners) l()
+            }
+        }
     }
 
-    private val main = Handler(Looper.getMainLooper())
     private var recorder: ScreenRecorder? = null
+    private var description = ""
+    private var elapsedBeforeMs = 0L
+    private var segmentStartMs = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> startRecording(intent)
-            ACTION_STOP -> recorder?.stop() ?: stopSelf()
+            ACTION_STOP -> {
+                val r = recorder
+                if (r != null) r.stop() else stopSelf()
+            }
+            ACTION_PAUSE -> setPaused(true)
+            ACTION_RESUME -> setPaused(false)
             else -> if (recorder == null) stopSelf()
         }
         return START_NOT_STICKY
@@ -60,10 +87,11 @@ class RecorderService : Service() {
         if (recorder != null) return
 
         createChannel()
+        description = "Подготовка записи…"
         // На Android 14+ startForeground нужно вызвать до getMediaProjection().
         startForeground(
             NOTIF_ID,
-            buildNotification("Подготовка записи…"),
+            buildNotification(),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
         )
 
@@ -92,30 +120,57 @@ class RecorderService : Service() {
             rec.onFinished = { uri -> onRecordingFinished(uri) }
             recorder = rec
 
-            val description = rec.start()
+            description = rec.start()
+            elapsedBeforeMs = 0L
+            segmentStartMs = System.currentTimeMillis()
+            isPaused = false
             isRecording = true
-            getSystemService(NotificationManager::class.java)
-                .notify(NOTIF_ID, buildNotification(description))
-            onStateChanged?.invoke()
+            updateNotification()
+            dispatchState()
         } catch (e: Throwable) {
             Log.e(TAG, "cannot start recording", e)
             Toast.makeText(this, "Не удалось начать запись: ${e.message}", Toast.LENGTH_LONG).show()
             recorder = null
             isRecording = false
+            isPaused = false
+            OverlayService.awaitingStart = false
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
-            onStateChanged?.invoke()
+            dispatchState()
         }
     }
 
-    private fun onRecordingFinished(uri: android.net.Uri?) {
+    private fun setPaused(pause: Boolean) {
+        val r = recorder
+        if (r == null || !isRecording) {
+            if (r == null) stopSelf()
+            return
+        }
+        if (pause == isPaused) return
+
+        val now = System.currentTimeMillis()
+        if (pause) {
+            r.pause()
+            elapsedBeforeMs += now - segmentStartMs
+        } else {
+            r.resume()
+            segmentStartMs = now
+        }
+        isPaused = pause
+        updateNotification()
+        dispatchState()
+    }
+
+    private fun onRecordingFinished(uri: Uri?) {
         recorder = null
         isRecording = false
+        isPaused = false
+        OverlayService.awaitingStart = false
         val msg = if (uri != null) "Запись сохранена: Movies/ScreenRec" else "Запись не сохранена"
         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        onStateChanged?.invoke()
+        dispatchState()
     }
 
     override fun onDestroy() {
@@ -123,6 +178,8 @@ class RecorderService : Service() {
         recorder?.stop()
         super.onDestroy()
     }
+
+    // ---------------------------------------------------------- уведомление
 
     private fun createChannel() {
         val nm = getSystemService(NotificationManager::class.java)
@@ -133,32 +190,47 @@ class RecorderService : Service() {
         }
     }
 
-    private fun buildNotification(text: String): Notification {
-        val stopIntent = PendingIntent.getService(
-            this, 0,
-            Intent(this, RecorderService::class.java).setAction(ACTION_STOP),
+    private fun updateNotification() {
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification())
+    }
+
+    private fun action(title: String, iconRes: Int, act: String, requestCode: Int): Notification.Action {
+        val pi = PendingIntent.getService(
+            this, requestCode,
+            Intent(this, RecorderService::class.java).setAction(act),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        return Notification.Action.Builder(Icon.createWithResource(this, iconRes), title, pi).build()
+    }
+
+    private fun buildNotification(): Notification {
         val openIntent = PendingIntent.getActivity(
             this, 1,
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val stopAction = Notification.Action.Builder(
-            Icon.createWithResource(this, android.R.drawable.ic_media_pause),
-            "Остановить",
-            stopIntent
-        ).build()
 
-        return Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("Идёт запись экрана")
-            .setContentText(text)
+        val b = Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(if (isPaused) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
+            .setContentTitle(if (isPaused) "Запись на паузе" else "Идёт запись экрана")
+            .setContentText(description)
             .setContentIntent(openIntent)
             .setOngoing(true)
-            .setUsesChronometer(true)
-            .setWhen(System.currentTimeMillis())
-            .addAction(stopAction)
-            .build()
+
+        if (isRecording) {
+            if (isPaused) {
+                b.addAction(action("Продолжить", android.R.drawable.ic_media_play, ACTION_RESUME, 10))
+            } else {
+                b.addAction(action("Пауза", android.R.drawable.ic_media_pause, ACTION_PAUSE, 11))
+            }
+        }
+        b.addAction(action("Остановить", android.R.drawable.ic_menu_close_clear_cancel, ACTION_STOP, 12))
+
+        if (isRecording && !isPaused) {
+            val now = System.currentTimeMillis()
+            val elapsed = elapsedBeforeMs + (now - segmentStartMs)
+            b.setUsesChronometer(true).setWhen(now - elapsed)
+        }
+        return b.build()
     }
 }

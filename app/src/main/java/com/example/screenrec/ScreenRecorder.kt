@@ -17,6 +17,7 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.projection.MediaProjection
 import android.net.Uri
+import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
@@ -162,6 +163,15 @@ class ScreenRecorder(
     private var outUri: Uri? = null
     private var videoThread: Thread? = null
     private var audioThread: Thread? = null
+
+    // --- пауза ---
+    private val pauseLock = Any()
+    private val pauses = ArrayList<LongArray>()   // завершённые паузы: [начало, конец] в мкс от baseUs
+    private var pauseStartRel = 0L
+
+    @Volatile
+    var paused = false
+        private set
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -369,7 +379,8 @@ class ScreenRecorder(
         val rec = AudioRecord.Builder()
             .setAudioPlaybackCaptureConfig(capture)
             .setAudioFormat(af)
-            .setBufferSizeInBytes(max(minBuf * 4, 32768))
+            // ~2 секунды запаса, чтобы звук не терялся, пока игра грузит процессор
+            .setBufferSizeInBytes(max(minBuf * 4, SAMPLE_RATE * 4 * 2))
             .build()
         audioRec = rec
         if (rec.state != AudioRecord.STATE_INITIALIZED) error("AudioRecord не инициализирован")
@@ -387,6 +398,10 @@ class ScreenRecorder(
     // --------------------------------------------------------------- потоки
 
     private fun videoLoop(enc: MediaCodec, muxer: SafeMuxer) {
+        // Если этот поток «голодает» под нагрузкой игры, кодек перестаёт принимать кадры.
+        try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        } catch (e: Throwable) { }
         val info = MediaCodec.BufferInfo()
         var track = -1
         var offset = Long.MIN_VALUE
@@ -408,13 +423,18 @@ class ScreenRecorder(
                             offset = if (abs(info.presentationTimeUs - baseUs) < 5_000_000L) baseUs
                             else info.presentationTimeUs - (nowUs - baseUs)
                         }
-                        var pts = max(0L, info.presentationTimeUs - offset)
-                        if (pts <= last) pts = last + 1
-                        last = pts
-                        info.presentationTimeUs = pts
-                        buf.position(info.offset)
-                        buf.limit(info.offset + info.size)
-                        muxer.write(track, buf, info)
+                        val rel = max(0L, info.presentationTimeUs - offset)
+                        val shift = pauseShiftFor(rel)
+                        // shift < 0: кадр снят во время паузы — пропускаем
+                        if (shift >= 0) {
+                            var pts = rel - shift
+                            if (pts <= last) pts = last + 1
+                            last = pts
+                            info.presentationTimeUs = pts
+                            buf.position(info.offset)
+                            buf.limit(info.offset + info.size)
+                            muxer.write(track, buf, info)
+                        }
                     }
                     enc.releaseOutputBuffer(idx, false)
                     if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) running = false
@@ -427,9 +447,14 @@ class ScreenRecorder(
     }
 
     private fun audioLoop(rec: AudioRecord, enc: MediaCodec, muxer: SafeMuxer) {
+        try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+        } catch (e: Throwable) { }
         val info = MediaCodec.BufferInfo()
         var track = -1
         var last = -1L
+        var frames = 0L      // сколько кадров звука уже отдано кодеку (включая вставленную тишину)
+        var startUs = 0L     // момент старта записи звука относительно baseUs
 
         fun drain(): Boolean {
             var eos = false
@@ -479,14 +504,42 @@ class ScreenRecorder(
             }
         }
 
+        // Вставляет тишину, чтобы звук не «убегал» вперёд видео, если часть данных потерялась.
+        fun feedSilence(frameCount: Long) {
+            val zeros = ByteArray(8192)
+            var left = frameCount
+            while (left > 0) {
+                val f = min(left, 2048L)   // 2048 кадров * 4 байта = 8192 байта
+                feed(zeros, (f * 4).toInt(), startUs + frames * 1_000_000L / SAMPLE_RATE, false)
+                frames += f
+                left -= f
+                drain()
+            }
+        }
+
         try {
             val pcm = ByteArray(8192)
             rec.startRecording()
-            val startUs = System.nanoTime() / 1000 - baseUs
-            var frames = 0L
+            startUs = System.nanoTime() / 1000 - baseUs
             while (!stopping) {
+                val t0 = System.nanoTime()
                 val n = rec.read(pcm, 0, pcm.size)
+                val t1 = System.nanoTime()
+                if (n > 0 && paused) {
+                    continue   // на паузе звук читаем и выбрасываем, чтобы буфер не переполнялся
+                }
                 if (n > 0) {
+                    // Если чтение ждало данные (буфер был пуст), мы «догнали» реальное время.
+                    // Тогда звуковая дорожка не должна отставать от часов больше, чем на ~100 мс:
+                    // иначе часть звука была потеряна, и мы заполняем разрыв тишиной.
+                    if (t1 - t0 > 3_000_000L) {
+                        val nowRel = t1 / 1000 - baseUs
+                        val endRel = startUs + (frames + n / 4) * 1_000_000L / SAMPLE_RATE
+                        val lagUs = nowRel - totalPausedUs() - endRel
+                        if (lagUs > 120_000L) {
+                            feedSilence((lagUs - 20_000L) * SAMPLE_RATE / 1_000_000L)
+                        }
+                    }
                     feed(pcm, n, startUs + frames * 1_000_000L / SAMPLE_RATE, false)
                     frames += n / 4   // 2 канала * 2 байта
                     drain()
@@ -509,6 +562,54 @@ class ScreenRecorder(
     }
 
     // ------------------------------------------------------------- остановка
+
+    // ----------------------------------------------------------------- пауза
+
+    private fun nowRel() = System.nanoTime() / 1000 - baseUs
+
+    /** Ставит запись на паузу: экран перестаёт попадать в кодек, нагрузки нет. */
+    fun pause() {
+        if (stopped.get()) return
+        synchronized(pauseLock) {
+            if (paused) return
+            pauseStartRel = nowRel()
+            paused = true
+        }
+        try { vDisplay?.setSurface(null) } catch (e: Throwable) { Log.w(TAG, "pause: setSurface(null)", e) }
+    }
+
+    /** Продолжает запись. Время паузы вырезается из видео и звука. */
+    fun resume() {
+        if (stopped.get()) return
+        synchronized(pauseLock) {
+            if (!paused) return
+            pauses.add(longArrayOf(pauseStartRel, nowRel()))
+            paused = false
+        }
+        try { vDisplay?.setSurface(inputSurface) } catch (e: Throwable) { Log.w(TAG, "resume: setSurface", e) }
+        try {
+            // Первый кадр после паузы делаем опорным, чтобы не было артефактов.
+            val b = Bundle()
+            b.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            videoEnc?.setParameters(b)
+        } catch (e: Throwable) { }
+    }
+
+    /** Сдвиг времени из-за пауз для кадра с меткой p; -1 — кадр снят во время паузы. */
+    private fun pauseShiftFor(p: Long): Long = synchronized(pauseLock) {
+        var shift = 0L
+        for (iv in pauses) {
+            if (p >= iv[1]) shift += iv[1] - iv[0]
+            else if (p >= iv[0]) return@synchronized -1L
+        }
+        if (paused && p >= pauseStartRel) -1L else shift
+    }
+
+    private fun totalPausedUs(): Long = synchronized(pauseLock) {
+        var s = 0L
+        for (iv in pauses) s += iv[1] - iv[0]
+        s
+    }
 
     fun stop() {
         if (!stopped.compareAndSet(false, true)) return

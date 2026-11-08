@@ -8,8 +8,10 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -26,13 +28,7 @@ class MainActivity : Activity() {
     private companion object {
         const val REQ_PERMISSIONS = 1
         const val REQ_CAPTURE = 2
-
-        val RES_LABELS = arrayOf("Родное разрешение экрана", "До 2160p (4K)", "До 1440p", "До 1080p")
-        val RES_VALUES = intArrayOf(Int.MAX_VALUE, 2160, 1440, 1080)
-        val FPS_LABELS = arrayOf("60 кадров/с", "30 кадров/с")
-        val FPS_VALUES = intArrayOf(60, 30)
-        val CODEC_LABELS = arrayOf("H.265 / HEVC (лучшее сжатие)", "H.264 (максимальная совместимость)")
-        val QUALITY_LABELS = arrayOf("Стандартное", "Высокое", "Максимальное")
+        const val REQ_NOTIFICATIONS = 3
     }
 
     private lateinit var prefs: SharedPreferences
@@ -41,16 +37,21 @@ class MainActivity : Activity() {
     private lateinit var spCodec: Spinner
     private lateinit var spQuality: Spinner
     private lateinit var swAudio: Switch
+    private lateinit var swOverlay: Switch
     private lateinit var btn: Button
     private lateinit var status: TextView
 
     private var audioGranted = false
+    private var updatingSwitch = false
+    private var pendingOverlay = false
+
+    private val stateListener: () -> Unit = { runOnUiThread { refreshUi() } }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        prefs = AppSettings.prefs(this)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -70,10 +71,10 @@ class MainActivity : Activity() {
             setPadding(0, dp(4), 0, dp(16))
         })
 
-        spRes = addSpinner(root, "Разрешение", "res", RES_LABELS, 0)
-        spFps = addSpinner(root, "Частота кадров", "fps", FPS_LABELS, 0)
-        spCodec = addSpinner(root, "Видеокодек", "codec", CODEC_LABELS, 0)
-        spQuality = addSpinner(root, "Качество (битрейт)", "quality", QUALITY_LABELS, 1)
+        spRes = addSpinner(root, "Разрешение", "res", AppSettings.RES_LABELS, 0)
+        spFps = addSpinner(root, "Частота кадров", "fps", AppSettings.FPS_LABELS, 0)
+        spCodec = addSpinner(root, "Видеокодек", "codec", AppSettings.CODEC_LABELS, 0)
+        spQuality = addSpinner(root, "Качество (битрейт)", "quality", AppSettings.QUALITY_LABELS, 1)
 
         swAudio = Switch(this).apply {
             text = "Записывать системный звук"
@@ -85,6 +86,23 @@ class MainActivity : Activity() {
         root.addView(swAudio)
         root.addView(TextView(this).apply {
             text = "Только звук, который играет на устройстве. Микрофон не записывается."
+            textSize = 12f
+            setTextColor(Color.GRAY)
+        })
+
+        swOverlay = Switch(this).apply {
+            text = "Плавающая кнопка поверх приложений"
+            textSize = 16f
+            setPadding(0, dp(20), 0, dp(4))
+            setOnCheckedChangeListener { _, checked ->
+                if (!updatingSwitch) onOverlayToggled(checked)
+            }
+        }
+        root.addView(swOverlay)
+        root.addView(TextView(this).apply {
+            text = "Кнопку можно перетаскивать. Нажми её в любом приложении или игре — запись начнётся, " +
+                "а кнопка исчезнет. В правом верхнем углу появится невидимая зона: " +
+                "касание — пауза / продолжить, долгое удержание — остановить запись."
             textSize = 12f
             setTextColor(Color.GRAY)
         })
@@ -131,12 +149,20 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        RecorderService.onStateChanged = { runOnUiThread { refreshUi() } }
+        RecorderService.addListener(stateListener)
+        if (pendingOverlay) {
+            pendingOverlay = false
+            if (Settings.canDrawOverlays(this)) {
+                startOverlay()
+            } else {
+                Toast.makeText(this, "Разрешение не выдано — кнопка не включена", Toast.LENGTH_LONG).show()
+            }
+        }
         refreshUi()
     }
 
     override fun onPause() {
-        RecorderService.onStateChanged = null
+        RecorderService.removeListener(stateListener)
         super.onPause()
     }
 
@@ -149,12 +175,46 @@ class MainActivity : Activity() {
         spCodec.isEnabled = !rec
         spQuality.isEnabled = !rec
         swAudio.isEnabled = !rec
-        status.text = if (rec) {
-            "Идёт запись. Остановить можно здесь или из шторки уведомлений."
+        status.text = when {
+            rec && RecorderService.isPaused -> "Запись на паузе. Продолжить можно из шторки уведомлений."
+            rec -> "Идёт запись. Остановить можно здесь или из шторки уведомлений."
+            else -> "Готово к записи. Видео сохраняются в папку Movies/ScreenRec."
+        }
+
+        // Состояние переключателя берём из реально работающего сервиса.
+        updatingSwitch = true
+        swOverlay.isChecked = OverlayService.isRunning
+        updatingSwitch = false
+    }
+
+    // ----------------------------------------------------- плавающая кнопка
+
+    private fun onOverlayToggled(enable: Boolean) {
+        if (enable) {
+            if (Settings.canDrawOverlays(this)) {
+                startOverlay()
+            } else {
+                pendingOverlay = true
+                Toast.makeText(this, "Включи «Поверх других приложений» для ScreenRec", Toast.LENGTH_LONG).show()
+                startActivity(
+                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                )
+            }
         } else {
-            "Готово к записи. Видео сохраняются в папку Movies/ScreenRec."
+            startService(Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_STOP_OVERLAY))
         }
     }
+
+    private fun startOverlay() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS)
+        }
+        startForegroundService(Intent(this, OverlayService::class.java))
+    }
+
+    // -------------------------------------------------------------- запись
 
     private fun onButtonClicked() {
         if (RecorderService.isRecording) {
@@ -176,7 +236,6 @@ class MainActivity : Activity() {
         }
     }
 
-    @Deprecated("Deprecated in Java")
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode != REQ_PERMISSIONS) return
@@ -204,16 +263,7 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Запись отменена", Toast.LENGTH_SHORT).show()
             return
         }
-        val intent = Intent(this, RecorderService::class.java)
-            .setAction(RecorderService.ACTION_START)
-            .putExtra(RecorderService.EXTRA_RESULT_CODE, resultCode)
-            .putExtra(RecorderService.EXTRA_DATA, data)
-            .putExtra(RecorderService.EXTRA_MAX_SHORT, RES_VALUES[spRes.selectedItemPosition])
-            .putExtra(RecorderService.EXTRA_FPS, FPS_VALUES[spFps.selectedItemPosition])
-            .putExtra(RecorderService.EXTRA_HEVC, spCodec.selectedItemPosition == 0)
-            .putExtra(RecorderService.EXTRA_QUALITY, spQuality.selectedItemPosition)
-            .putExtra(RecorderService.EXTRA_AUDIO, audioGranted)
-        startForegroundService(intent)
+        startForegroundService(AppSettings.startIntent(this, resultCode, data, audioGranted))
         // Сворачиваемся, чтобы пользователь сразу видел свой экран.
         moveTaskToBack(true)
     }
